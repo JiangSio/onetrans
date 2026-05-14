@@ -18,9 +18,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from models.taac_onetrans import TAACOneTransClassifier
-from utils.common import json_ready_args, set_seed, split_indices, take_rows
+from utils.common import json_ready_args, set_seed
 from utils.metrics import accuracy_from_logits, multiclass_auc_from_logits
-from utils.taac_data import build_tensors, load_train_split
+
 
 MASK_TYPE_CHOICES = ("paper_causal", "origin", "hard_mask", "bimask_soft", "bimask_hard")
 
@@ -62,11 +62,9 @@ def normalize_mask_type(mask_type: str) -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Download TAAC2026/data_sample_1000, convert it into OneTrans inputs, and run a small classifier."
+        description="Run OneTrans classifier on Amazon18 dataset."
     )
-    parser.add_argument("--dataset-id", default="TAAC2026/data_sample_1000")
-    parser.add_argument("--local-parquet", type=Path, default=None, help="Skip Hugging Face download and read a local parquet.")
-    parser.add_argument("--cache-dir", type=Path, default=PROJECT_ROOT / ".cache" / "taac2026")
+    parser.add_argument("--data-dir", type=Path, default=PROJECT_ROOT / "dataset" / "data" / "Amazon18" / "Industrial_and_Scientific")
     parser.add_argument("--max-rows", type=int, default=None, help="Limit the number of rows loaded for quick checks.")
     parser.add_argument("--seq-len", type=int, default=16, help="Maximum sequence length kept per sample.")
     parser.add_argument("--ns-len", type=int, default=4, help="Number of non-sequence pseudo tokens.")
@@ -104,7 +102,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--val-ratio", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--amp", dest="amp", action="store_true", help="Enable automatic mixed precision.")
@@ -117,7 +114,7 @@ def parse_args() -> argparse.Namespace:
         help="Autocast dtype on CUDA. Use bf16 if fp16 overflows or is unstable.",
     )
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "outputs" / "taac2026_sample")
+    parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "outputs" / "amazon18")
     parser.add_argument(
         "--resume",
         type=str,
@@ -126,6 +123,127 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--save-checkpoint", action="store_true")
     return parser.parse_args()
+
+
+def load_interaction_file(file_path: Path) -> list[tuple[int, list[int], int]]:
+    interactions = []
+    with open(file_path, "r", encoding="utf-8") as f:
+        header = f.readline()
+        for line in f:
+            parts = line.strip().split("\t")
+            if len(parts) < 3:
+                continue
+            user_id = int(parts[0])
+            history_items = [int(x) for x in parts[1].split()] if parts[1] else []
+            target_item = int(parts[2])
+            interactions.append((user_id, history_items, target_item))
+    return interactions
+
+
+def load_item_features(item_json_path: Path) -> dict[int, dict[str, Any]]:
+    with open(item_json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return {int(k): v for k, v in data.items()}
+
+
+def load_interactions_json(inter_json_path: Path) -> dict[int, list[int]]:
+    with open(inter_json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return {int(k): v for k, v in data.items()}
+
+
+def build_item_feature_vector(item_features: dict[str, Any]) -> list[float]:
+    features = []
+    title = item_features.get("title", "")
+    description = item_features.get("description", "")
+    brand = item_features.get("brand", "")
+    categories = item_features.get("categories", "")
+
+    title_len = len(title) if title else 0
+    desc_len = len(description) if description else 0
+    brand_len = len(brand) if brand else 0
+    cat_len = len(categories) if categories else 0
+
+    title_words = len(title.split()) if title else 0
+    desc_words = len(description.split()) if description else 0
+
+    features.extend([
+        math.log1p(title_len),
+        math.log1p(desc_len),
+        math.log1p(brand_len),
+        math.log1p(cat_len),
+        math.log1p(title_words),
+        math.log1p(desc_words),
+        1.0 if brand else 0.0,
+        1.0 if categories else 0.0,
+    ])
+    return features
+
+
+def build_tensors_from_interactions(
+    interactions: list[tuple[int, list[int], int]],
+    item_features: dict[int, dict[str, Any]],
+    user_interactions: dict[int, list[int]],
+    seq_len: int,
+    max_rows: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, Any]]:
+    if max_rows is not None:
+        interactions = interactions[:max_rows]
+
+    non_seq_vectors: list[list[float]] = []
+    seq_matrices: list[list[list[float]]] = []
+    labels: list[int] = []
+
+    all_items = sorted(item_features.keys())
+    item_to_idx = {item: idx for idx, item in enumerate(all_items)}
+    num_classes = len(all_items)
+
+    for user_id, history_items, target_item in interactions:
+        user_inter_count = len(user_interactions.get(user_id, []))
+        user_history_count = len(history_items)
+
+        non_seq = [
+            math.log1p(user_inter_count),
+            math.log1p(user_history_count),
+            1.0 if user_history_count > 0 else 0.0,
+        ]
+
+        seq_features: list[list[float]] = []
+        for item_id in history_items[-seq_len:]:
+            if item_id in item_features:
+                seq_features.append(build_item_feature_vector(item_features[item_id]))
+            else:
+                seq_features.append([0.0] * 8)
+
+        while len(seq_features) < seq_len:
+            seq_features.append([0.0] * 8)
+
+        seq_matrices.append(seq_features)
+        non_seq_vectors.append(non_seq)
+
+        target_idx = item_to_idx.get(target_item, 0)
+        labels.append(target_idx)
+
+    seq_feature_dim = len(seq_matrices[0][0]) if seq_matrices else 8
+    non_seq_dim = len(non_seq_vectors[0]) if non_seq_vectors else 3
+
+    non_seq_tensor = torch.tensor(non_seq_vectors, dtype=torch.float32)
+    seq_tensor = torch.zeros(len(seq_matrices), seq_len, seq_feature_dim, dtype=torch.float32)
+    for i, matrix in enumerate(seq_matrices):
+        for j, row in enumerate(matrix[:seq_len]):
+            seq_tensor[i, j, : len(row)] = torch.tensor(row, dtype=torch.float32)
+
+    label_tensor = torch.tensor(labels, dtype=torch.long)
+
+    metadata = {
+        "num_classes": num_classes,
+        "non_seq_dim": non_seq_dim,
+        "seq_feature_dim": seq_feature_dim,
+        "seq_len": seq_len,
+        "num_train_samples": len(interactions),
+    }
+
+    return non_seq_tensor, seq_tensor, label_tensor, metadata
 
 
 def run_epoch(
@@ -188,12 +306,16 @@ def build_loaders(
     labels: torch.Tensor,
     batch_size: int,
     num_workers: int,
-    val_ratio: float,
-    seed: int,
 ) -> tuple[DataLoader, DataLoader]:
-    train_idx, val_idx = split_indices(labels.size(0), val_ratio, seed)
-    train_dataset = TensorDataset(non_seq_x[train_idx], seq_x[train_idx], labels[train_idx])
-    val_dataset = TensorDataset(non_seq_x[val_idx], seq_x[val_idx], labels[val_idx])
+    num_samples = labels.size(0)
+    indices = torch.randperm(num_samples)
+    val_size = int(num_samples * 0.1)
+    train_indices = indices[val_size:]
+    val_indices = indices[:val_size]
+
+    train_dataset = TensorDataset(non_seq_x[train_indices], seq_x[train_indices], labels[train_indices])
+    val_dataset = TensorDataset(non_seq_x[val_indices], seq_x[val_indices], labels[val_indices])
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -283,7 +405,6 @@ def load_checkpoint_state(
 
 
 def main() -> None:
-    import pdb;pdb.set_trace()
     args = parse_args()
     set_seed(args.seed)
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -292,18 +413,45 @@ def main() -> None:
     use_amp = should_enable_amp(device_type=device_type, amp=args.amp, amp_dtype=args.amp_dtype)
     scaler = build_scaler(device_type=device_type, use_amp=use_amp, amp_dtype=amp_dtype)
 
-    dataset = load_train_split(args.dataset_id, args.cache_dir, args.local_parquet)
-    rows = take_rows(dataset, args.max_rows)
-    non_seq_x, seq_x, labels, metadata = build_tensors(rows, args.seq_len)
+    dataset_name = args.data_dir.name
+    item_json_path = args.data_dir / f"{dataset_name}.item.json"
+    inter_json_path = args.data_dir / f"{dataset_name}.inter.json"
+    train_path = args.data_dir / f"{dataset_name}.train.inter"
+    valid_path = args.data_dir / f"{dataset_name}.valid.inter"
+    test_path = args.data_dir / f"{dataset_name}.test.inter"
+
+    print(f"[data] loading item features from {item_json_path}")
+    item_features = load_item_features(item_json_path)
+    print(f"[data] loaded {len(item_features)} item features")
+
+    print(f"[data] loading interactions from {inter_json_path}")
+    user_interactions = load_interactions_json(inter_json_path)
+    print(f"[data] loaded interactions for {len(user_interactions)} users")
+
+    print(f"[data] loading train/valid/test splits")
+    train_interactions = load_interaction_file(train_path)
+    valid_interactions = load_interaction_file(valid_path)
+    test_interactions = load_interaction_file(test_path)
+    print(f"[data] train={len(train_interactions)} valid={len(valid_interactions)} test={len(test_interactions)}")
+
+    print(f"[data] building tensors from train split")
+    non_seq_x, seq_x, labels, metadata = build_tensors_from_interactions(
+        interactions=train_interactions,
+        item_features=item_features,
+        user_interactions=user_interactions,
+        seq_len=args.seq_len,
+        max_rows=args.max_rows,
+    )
+    print(f"[data] tensors built: non_seq={tuple(non_seq_x.shape)} seq={tuple(seq_x.shape)} labels={tuple(labels.shape)}")
+
     train_loader, val_loader = build_loaders(
         non_seq_x=non_seq_x,
         seq_x=seq_x,
         labels=labels,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        val_ratio=args.val_ratio,
-        seed=args.seed,
     )
+
     model = build_model(args, non_seq_x, seq_x, labels)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     criterion = nn.CrossEntropyLoss()
@@ -312,7 +460,7 @@ def main() -> None:
     print("[run] metadata")
     print(json.dumps(metadata, indent=2, ensure_ascii=False))
     print(f"[run] device={args.device} samples={labels.size(0)} train={len(train_loader.dataset)} val={len(val_loader.dataset)}")
-    print(f"[run] non_seq={tuple(non_seq_x.shape)} seq={tuple(seq_x.shape)} classes={int(labels.max().item()) + 1}")
+    print(f"[run] non_seq={tuple(non_seq_x.shape)} seq={tuple(seq_x.shape)} classes={metadata['num_classes']}")
     print(
         f"[run] amp={use_amp} amp_dtype={args.amp_dtype} "
         f"grad_scaler={scaler.is_enabled()} device_type={device_type} mask_type={args.mask_type} "
