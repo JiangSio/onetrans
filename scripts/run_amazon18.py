@@ -304,37 +304,63 @@ def build_tensors_from_interactions(
 
 def run_epoch(
     model: nn.Module,
-    loader: DataLoader,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
     criterion: nn.Module,
     device: str,
     amp_dtype: torch.dtype,
     use_amp: bool,
     scaler: torch.amp.GradScaler,
     optimizer: torch.optim.Optimizer | None = None,
-) -> tuple[float, float, float]:
+    train_per_val: int = 5,
+    desc: str = "",
+) -> tuple[float, float, float, float, float, float]:
     is_train = optimizer is not None
     device_type = parse_device_type(device)
     model.train(is_train)
-    total_loss = 0.0
-    total_acc = 0.0
-    total_items = 0
-    epoch_logits: list[torch.Tensor] = []
-    epoch_labels: list[torch.Tensor] = []
+    
+    train_total_loss = 0.0
+    train_total_acc = 0.0
+    train_total_items = 0
+    train_logits: list[torch.Tensor] = []
+    train_labels: list[torch.Tensor] = []
+    
+    val_total_loss = 0.0
+    val_total_acc = 0.0
+    val_total_items = 0
+    val_logits: list[torch.Tensor] = []
+    val_labels: list[torch.Tensor] = []
+    
+    train_iter = iter(train_loader)
+    val_iter = iter(val_loader)
+    
+    total_batches = len(train_loader)
+    pbar = tqdm(total=total_batches, desc=f"{desc}", leave=True)
+    
+    train_loss_count = 0
+    train_loss_sum = 0.0
+    val_loss_sum = 0.0
+    val_loss_count = 0
+    train_batch_count = 0
+    
+    while True:
+        batch_count = 0
+        while batch_count < train_per_val:
+            try:
+                non_seq_x, seq_x, labels = next(train_iter)
+            except StopIteration:
+                break
+            
+            non_seq_x = non_seq_x.to(device)
+            seq_x = seq_x.to(device)
+            labels = labels.to(device)
 
-    for non_seq_x, seq_x, labels in loader:
-        non_seq_x = non_seq_x.to(device)
-        seq_x = seq_x.to(device)
-        labels = labels.to(device)
-
-        if is_train:
             optimizer.zero_grad(set_to_none=True)
 
-        with autocast_context(device_type=device_type, amp_dtype=amp_dtype, use_amp=use_amp):
-            logits = model(non_seq_x, seq_x)
-            import pdb; pdb.set_trace()
-            loss = criterion(logits, labels)
+            with autocast_context(device_type=device_type, amp_dtype=amp_dtype, use_amp=use_amp):
+                logits = model(non_seq_x, seq_x)
+                loss = criterion(logits, labels)
 
-        if is_train:
             if scaler.is_enabled():
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
@@ -343,18 +369,64 @@ def run_epoch(
                 loss.backward()
                 optimizer.step()
 
+            batch_size = labels.size(0)
+            train_total_items += batch_size
+            train_total_loss += loss.item() * batch_size
+            train_total_acc += accuracy_from_logits(logits.detach(), labels) * batch_size
+            train_logits.append(logits.detach().cpu())
+            train_labels.append(labels.detach().cpu())
+            
+            train_loss_sum += loss.item()
+            train_loss_count += 1
+            train_batch_count += 1
+            batch_count += 1
+            
+            pbar.update(1)
+            pbar.set_postfix({
+                "train_loss": f"{train_loss_sum / max(train_loss_count, 1):.4f}",
+                "val_loss": f"{val_loss_sum / max(val_loss_count, 1):.4f}"
+            })
+        
+        if batch_count == 0:
+            break
+        
+        try:
+            non_seq_x, seq_x, labels = next(val_iter)
+        except StopIteration:
+            val_iter = iter(val_loader)
+            non_seq_x, seq_x, labels = next(val_iter)
+        
+        non_seq_x = non_seq_x.to(device)
+        seq_x = seq_x.to(device)
+        labels = labels.to(device)
+
+        with autocast_context(device_type=device_type, amp_dtype=amp_dtype, use_amp=use_amp):
+            logits = model(non_seq_x, seq_x)
+            loss = criterion(logits, labels)
+
         batch_size = labels.size(0)
-        total_items += batch_size
-        total_loss += loss.item() * batch_size
-        total_acc += accuracy_from_logits(logits.detach(), labels) * batch_size
-        epoch_logits.append(logits.detach().cpu())
-        epoch_labels.append(labels.detach().cpu())
-
-    if total_items == 0:
-        return 0.0, 0.0, float("nan")
-
-    auc = multiclass_auc_from_logits(torch.cat(epoch_logits, dim=0), torch.cat(epoch_labels, dim=0))
-    return total_loss / total_items, total_acc / total_items, auc
+        val_total_items += batch_size
+        val_total_loss += loss.item() * batch_size
+        val_total_acc += accuracy_from_logits(logits.detach(), labels) * batch_size
+        val_logits.append(logits.detach().cpu())
+        val_labels.append(labels.detach().cpu())
+        
+        val_loss_sum += loss.item()
+        val_loss_count += 1
+    
+    pbar.close()
+    
+    train_auc = multiclass_auc_from_logits(torch.cat(train_logits, dim=0), torch.cat(train_labels, dim=0)) if train_total_items > 0 else float("nan")
+    val_auc = multiclass_auc_from_logits(torch.cat(val_logits, dim=0), torch.cat(val_labels, dim=0)) if val_total_items > 0 else float("nan")
+    
+    return (
+        train_total_loss / train_total_items if train_total_items > 0 else 0.0,
+        train_total_acc / train_total_items if train_total_items > 0 else 0.0,
+        train_auc,
+        val_total_loss / val_total_items if val_total_items > 0 else 0.0,
+        val_total_acc / val_total_items if val_total_items > 0 else 0.0,
+        val_auc,
+    )
 
 
 def build_loaders(
@@ -551,24 +623,18 @@ def main() -> None:
 
     
     for epoch in range(start_epoch, args.epochs + 1):
-        train_loss, train_acc, train_auc = run_epoch(
+        train_loss, train_acc, train_auc, val_loss, val_acc, val_auc = run_epoch(
             model,
             train_loader,
-            criterion,
-            args.device,
-            amp_dtype=amp_dtype,
-            use_amp=use_amp,
-            scaler=scaler,
-            optimizer=optimizer,
-        )
-        val_loss, val_acc, val_auc = run_epoch(
-            model,
             val_loader,
             criterion,
             args.device,
             amp_dtype=amp_dtype,
             use_amp=use_amp,
             scaler=scaler,
+            optimizer=optimizer,
+            train_per_val=5,
+            desc=f"Epoch {epoch:02d}",
         )
         print(
             f"[epoch {epoch:02d}] "
