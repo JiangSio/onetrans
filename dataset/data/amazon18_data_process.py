@@ -403,7 +403,7 @@ def create_item_features_amazon18_style(metadata, item2index, id_title):
                 
             brand = meta.get("brand", "").replace("by\n", "").strip()
             
-            categories = meta.get("categories", [])
+            categories = meta.get("category", [])
             if categories and len(categories) > 0:
                 # Handle both list and string formats
                 if isinstance(categories[0], list):

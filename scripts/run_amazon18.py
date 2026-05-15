@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import json
 import math
+import random
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -114,6 +115,8 @@ def parse_args() -> argparse.Namespace:
         help="Autocast dtype on CUDA. Use bf16 if fp16 overflows or is unstable.",
     )
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--negative-samples", type=int, default=5)
+    
     parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "outputs" / "amazon18")
     parser.add_argument(
         "--resume",
@@ -140,44 +143,28 @@ def load_interaction_file(file_path: Path) -> list[tuple[int, list[int], int]]:
     return interactions
 
 
-def load_item_features(item_json_path: Path) -> dict[int, dict[str, Any]]:
-    with open(item_json_path, "r", encoding="utf-8") as f:
+def load_item_features(item_info_path: Path) -> dict[int, dict[str, str]]:
+    item_features = {}
+    with open(item_info_path, "r", encoding="utf-8") as f:
+        header = f.readline()
+        for line in f:
+            parts = line.strip().split("\t")
+            if len(parts) >= 5:
+                item_id = int(parts[0])
+                item_features[item_id] = {
+                    "title": parts[1],
+                    "description": parts[2],
+                    "brand": parts[3],
+                    "categories": parts[4],
+                }
+    return item_features
+
+
+def load_interactions_json(json_path: Path) -> dict[int, list[int]]:
+    import json
+    with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
     return {int(k): v for k, v in data.items()}
-
-
-def load_interactions_json(inter_json_path: Path) -> dict[int, list[int]]:
-    with open(inter_json_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    return {int(k): v for k, v in data.items()}
-
-
-def build_item_feature_vector(item_features: dict[str, Any]) -> list[float]:
-    features = []
-    title = item_features.get("title", "")
-    description = item_features.get("description", "")
-    brand = item_features.get("brand", "")
-    categories = item_features.get("categories", "")
-
-    title_len = len(title) if title else 0
-    desc_len = len(description) if description else 0
-    brand_len = len(brand) if brand else 0
-    cat_len = len(categories) if categories else 0
-
-    title_words = len(title.split()) if title else 0
-    desc_words = len(description.split()) if description else 0
-
-    features.extend([
-        math.log1p(title_len),
-        math.log1p(desc_len),
-        math.log1p(brand_len),
-        math.log1p(cat_len),
-        math.log1p(title_words),
-        math.log1p(desc_words),
-        1.0 if brand else 0.0,
-        1.0 if categories else 0.0,
-    ])
-    return features
 
 
 def build_tensors_from_interactions(
@@ -190,48 +177,117 @@ def build_tensors_from_interactions(
     if max_rows is not None:
         interactions = interactions[:max_rows]
 
-    non_seq_vectors: list[list[float]] = []
-    seq_matrices: list[list[list[float]]] = []
+    non_seq_vectors: list[list[int]] = []
+    seq_matrices: list[list[list[int]]] = []
     labels: list[int] = []
 
     all_items = sorted(item_features.keys())
-    item_to_idx = {item: idx for idx, item in enumerate(all_items)}
-    num_classes = len(all_items)
+    item_to_idx = {item: idx + 1 for idx, item in enumerate(all_items)}
+    item_to_idx["UNK"] = 0
+    num_classes = len(all_items) + 1
+
+    brands = set()
+    categories = set()
+    for item_id in item_features:
+        brand = item_features[item_id].get("brand", "").strip()
+        if brand:
+            brands.add(brand)
+        cats = item_features[item_id].get("categories", "")
+        if cats:
+            for cat in cats.split(","):
+                cat = cat.strip()
+                if cat:
+                    categories.add(cat)
+
+    brand_to_idx = {brand: idx + 1 for idx, brand in enumerate(sorted(brands))}
+    brand_to_idx[""] = 0
+    category_to_idx = {cat: idx + 1 for idx, cat in enumerate(sorted(categories))}
+    category_to_idx[""] = 0
+
+    max_cat_count = 5
+
+    all_users = set()
+    for user_id, _, _ in interactions:
+        all_users.add(user_id)
+
+    user_to_idx = {user: idx + 1 for idx, user in enumerate(sorted(all_users))}
+    user_to_idx["UNK"] = 0
 
     for user_id, history_items, target_item in interactions:
-        user_inter_count = len(user_interactions.get(user_id, []))
-        user_history_count = len(history_items)
-
-        non_seq = [
-            math.log1p(user_inter_count),
-            math.log1p(user_history_count),
-            1.0 if user_history_count > 0 else 0.0,
-        ]
-
-        seq_features: list[list[float]] = []
+        user_idx = user_to_idx.get(user_id, 0)
+        target_idx = item_to_idx.get(target_item, 0)
+        target_brand = item_features.get(target_item, {}).get("brand", "").strip()
+        target_brand_idx = brand_to_idx.get(target_brand, 0)
+        target_categories = item_features.get(target_item, {}).get("categories", "")
+        cat_indices = []
+        if target_categories:
+            for cat in target_categories.split(",")[:max_cat_count]:
+                cat = cat.strip()
+                if cat:
+                    cat_indices.append(category_to_idx.get(cat, 0))
+            while len(cat_indices) < max_cat_count:
+                cat_indices.append(0)
+        
+        non_seq = [user_idx, target_idx, target_brand_idx] + cat_indices
+        
+        seq_features: list[list[int]] = []
         for item_id in history_items[-seq_len:]:
-            if item_id in item_features:
-                seq_features.append(build_item_feature_vector(item_features[item_id]))
-            else:
-                seq_features.append([0.0] * 8)
+            item_idx = item_to_idx.get(item_id, 0)
+            
+            brand = item_features.get(item_id, {}).get("brand", "").strip()
+            brand_idx = brand_to_idx.get(brand, 0)
+            
+            cats = item_features.get(item_id, {}).get("categories", "")
+            cat_indices = []
+            if cats:
+                for cat in cats.split(",")[:max_cat_count]:
+                    cat = cat.strip()
+                    if cat:
+                        cat_indices.append(category_to_idx.get(cat, 0))
+            
+            while len(cat_indices) < max_cat_count:
+                cat_indices.append(0)
+            
+            seq_feature = [item_idx, brand_idx] + cat_indices
+            seq_features.append(seq_feature)
 
         while len(seq_features) < seq_len:
-            seq_features.append([0.0] * 8)
+            seq_features.append([0] * (2 + max_cat_count))
 
         seq_matrices.append(seq_features)
         non_seq_vectors.append(non_seq)
 
-        target_idx = item_to_idx.get(target_item, 0)
-        labels.append(target_idx)
+        
+        labels.append(1)
 
-    seq_feature_dim = len(seq_matrices[0][0]) if seq_matrices else 8
-    non_seq_dim = len(non_seq_vectors[0]) if non_seq_vectors else 3
+        for _ in range(args.negative_samples):
+            random_user_id = random.choice(list(all_users))
+            while random_user_id == user_id:
+                random_user_id = random.choice(list(all_users))
+            negative_item = random.choice(list(user_interactions[random_user_id]))
+            negative_idx = item_to_idx.get(negative_item, 0)
+            negative_brand = item_features.get(negative_item, {}).get("brand", "").strip()
+            negative_brand_idx = brand_to_idx.get(negative_brand, 0)
+            negative_categories = item_features.get(negative_item, {}).get("categories", "")
+            cat_indices = []
+            if negative_categories:
+                for cat in negative_categories.split(",")[:max_cat_count]:
+                    cat = cat.strip()
+                    if cat:
+                        cat_indices.append(category_to_idx.get(cat, 0))
+            while len(cat_indices) < max_cat_count:
+                cat_indices.append(0)
+            non_seq_vectors.append([user_idx, negative_idx, negative_brand_idx] + cat_indices)
+            seq_matrices.append([[0] * (2 + max_cat_count)] * seq_len)
 
-    non_seq_tensor = torch.tensor(non_seq_vectors, dtype=torch.float32)
-    seq_tensor = torch.zeros(len(seq_matrices), seq_len, seq_feature_dim, dtype=torch.float32)
+    seq_feature_dim = len(seq_matrices[0][0]) if seq_matrices else (2 + max_cat_count)
+    non_seq_dim = len(non_seq_vectors[0]) if non_seq_vectors else (3 + max_cat_count)
+
+    non_seq_tensor = torch.tensor(non_seq_vectors, dtype=torch.long)
+    seq_tensor = torch.zeros(len(seq_matrices), seq_len, seq_feature_dim, dtype=torch.long)
     for i, matrix in enumerate(seq_matrices):
         for j, row in enumerate(matrix[:seq_len]):
-            seq_tensor[i, j, : len(row)] = torch.tensor(row, dtype=torch.float32)
+            seq_tensor[i, j, : len(row)] = torch.tensor(row, dtype=torch.long)
 
     label_tensor = torch.tensor(labels, dtype=torch.long)
 
@@ -241,6 +297,11 @@ def build_tensors_from_interactions(
         "seq_feature_dim": seq_feature_dim,
         "seq_len": seq_len,
         "num_train_samples": len(interactions),
+        "num_brands": len(brand_to_idx),
+        "num_categories": len(category_to_idx),
+        "max_cat_count": max_cat_count,
+        "brand_to_idx": brand_to_idx,
+        "category_to_idx": category_to_idx,
     }
 
     return non_seq_tensor, seq_tensor, label_tensor, metadata
@@ -433,14 +494,15 @@ def main() -> None:
     valid_interactions = load_interaction_file(valid_path)
     test_interactions = load_interaction_file(test_path)
     print(f"[data] train={len(train_interactions)} valid={len(valid_interactions)} test={len(test_interactions)}")
-
-    print(f"[data] building tensors from train split")
+    
+    print(f"[data] building tensors from train split with negative samples={args.negative_samples}")
     non_seq_x, seq_x, labels, metadata = build_tensors_from_interactions(
         interactions=train_interactions,
         item_features=item_features,
         user_interactions=user_interactions,
         seq_len=args.seq_len,
         max_rows=args.max_rows,
+        negative_samples=args.negative_samples,
     )
     print(f"[data] tensors built: non_seq={tuple(non_seq_x.shape)} seq={tuple(seq_x.shape)} labels={tuple(labels.shape)}")
 
