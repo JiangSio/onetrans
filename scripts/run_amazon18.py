@@ -143,21 +143,10 @@ def load_interaction_file(file_path: Path) -> list[tuple[int, list[int], int]]:
     return interactions
 
 
-def load_item_features(item_info_path: Path) -> dict[int, dict[str, str]]:
-    item_features = {}
-    with open(item_info_path, "r", encoding="utf-8") as f:
-        header = f.readline()
-        for line in f:
-            parts = line.strip().split("\t")
-            if len(parts) >= 5:
-                item_id = int(parts[0])
-                item_features[item_id] = {
-                    "title": parts[1],
-                    "description": parts[2],
-                    "brand": parts[3],
-                    "categories": parts[4],
-                }
-    return item_features
+def load_item_features(item_json_path: Path) -> dict[int, dict[str, str]]:
+    with open(item_json_path, "r", encoding="utf-8") as f:
+        item_features = json.load(f)
+    return {int(k): v for k, v in item_features.items()}
 
 
 def load_interactions_json(json_path: Path) -> dict[int, list[int]]:
@@ -173,6 +162,7 @@ def build_tensors_from_interactions(
     user_interactions: dict[int, list[int]],
     seq_len: int,
     max_rows: int | None = None,
+    negative_samples: int = 5,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, Any]]:
     if max_rows is not None:
         interactions = interactions[:max_rows]
@@ -225,10 +215,12 @@ def build_tensors_from_interactions(
                 cat = cat.strip()
                 if cat:
                     cat_indices.append(category_to_idx.get(cat, 0))
-            while len(cat_indices) < max_cat_count:
-                cat_indices.append(0)
+        while len(cat_indices) < max_cat_count:
+            cat_indices.append(0)
         
         non_seq = [user_idx, target_idx, target_brand_idx] + cat_indices
+
+        assert len(non_seq) == 3 + max_cat_count, f"{non_seq}"
         
         seq_features: list[list[int]] = []
         for item_id in history_items[-seq_len:]:
@@ -256,15 +248,12 @@ def build_tensors_from_interactions(
 
         seq_matrices.append(seq_features)
         non_seq_vectors.append(non_seq)
-
-        
         labels.append(1)
 
-        for _ in range(args.negative_samples):
-            random_user_id = random.choice(list(all_users))
+        for _ in range(negative_samples):
+            random_user_id,_,negative_item = random.choice(interactions)
             while random_user_id == user_id:
-                random_user_id = random.choice(list(all_users))
-            negative_item = random.choice(list(user_interactions[random_user_id]))
+                random_user_id,_,negative_item = random.choice(interactions)
             negative_idx = item_to_idx.get(negative_item, 0)
             negative_brand = item_features.get(negative_item, {}).get("brand", "").strip()
             negative_brand_idx = brand_to_idx.get(negative_brand, 0)
@@ -277,18 +266,18 @@ def build_tensors_from_interactions(
                         cat_indices.append(category_to_idx.get(cat, 0))
             while len(cat_indices) < max_cat_count:
                 cat_indices.append(0)
+            
             non_seq_vectors.append([user_idx, negative_idx, negative_brand_idx] + cat_indices)
-            seq_matrices.append([[0] * (2 + max_cat_count)] * seq_len)
+            seq_matrices.append(seq_features)
+            labels.append(0)
 
+    
     seq_feature_dim = len(seq_matrices[0][0]) if seq_matrices else (2 + max_cat_count)
     non_seq_dim = len(non_seq_vectors[0]) if non_seq_vectors else (3 + max_cat_count)
 
     non_seq_tensor = torch.tensor(non_seq_vectors, dtype=torch.long)
-    seq_tensor = torch.zeros(len(seq_matrices), seq_len, seq_feature_dim, dtype=torch.long)
-    for i, matrix in enumerate(seq_matrices):
-        for j, row in enumerate(matrix[:seq_len]):
-            seq_tensor[i, j, : len(row)] = torch.tensor(row, dtype=torch.long)
-
+    seq_tensor = torch.tensor(seq_matrices, dtype=torch.long)
+    
     label_tensor = torch.tensor(labels, dtype=torch.long)
 
     metadata = {
@@ -361,7 +350,7 @@ def run_epoch(
     return total_loss / total_items, total_acc / total_items, auc
 
 
-def build_loaders(
+def build_train_loaders(
     non_seq_x: torch.Tensor,
     seq_x: torch.Tensor,
     labels: torch.Tensor,
@@ -369,13 +358,8 @@ def build_loaders(
     num_workers: int,
 ) -> tuple[DataLoader, DataLoader]:
     num_samples = labels.size(0)
-    indices = torch.randperm(num_samples)
-    val_size = int(num_samples * 0.1)
-    train_indices = indices[val_size:]
-    val_indices = indices[:val_size]
 
-    train_dataset = TensorDataset(non_seq_x[train_indices], seq_x[train_indices], labels[train_indices])
-    val_dataset = TensorDataset(non_seq_x[val_indices], seq_x[val_indices], labels[val_indices])
+    train_dataset = TensorDataset(non_seq_x, seq_x, labels)
 
     train_loader = DataLoader(
         train_dataset,
@@ -383,13 +367,8 @@ def build_loaders(
         shuffle=True,
         num_workers=num_workers,
     )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-    )
-    return train_loader, val_loader
+
+    return train_loader
 
 
 def build_model(args: argparse.Namespace, non_seq_x: torch.Tensor, seq_x: torch.Tensor, labels: torch.Tensor) -> nn.Module:
@@ -496,6 +475,7 @@ def main() -> None:
     print(f"[data] train={len(train_interactions)} valid={len(valid_interactions)} test={len(test_interactions)}")
     
     print(f"[data] building tensors from train split with negative samples={args.negative_samples}")
+
     non_seq_x, seq_x, labels, metadata = build_tensors_from_interactions(
         interactions=train_interactions,
         item_features=item_features,
@@ -504,9 +484,10 @@ def main() -> None:
         max_rows=args.max_rows,
         negative_samples=args.negative_samples,
     )
+    import pdb; pdb.set_trace()
     print(f"[data] tensors built: non_seq={tuple(non_seq_x.shape)} seq={tuple(seq_x.shape)} labels={tuple(labels.shape)}")
 
-    train_loader, val_loader = build_loaders(
+    train_loader = build_train_loaders(
         non_seq_x=non_seq_x,
         seq_x=seq_x,
         labels=labels,
