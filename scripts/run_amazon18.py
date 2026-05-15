@@ -100,11 +100,11 @@ def parse_args() -> argparse.Namespace:
         help="Disable activation checkpointing inside OneTrans blocks.",
     )
     parser.set_defaults(use_checkpoint=False)
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--val-ratio", type=float, default=0.2)
+    parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--amp", dest="amp", action="store_true", help="Enable automatic mixed precision.")
@@ -334,7 +334,7 @@ def run_epoch(
 
         with autocast_context(device_type=device_type, amp_dtype=amp_dtype, use_amp=use_amp):
             logits = model(non_seq_x, seq_x)
-            import pdb; pdb.set_trace()
+            
             loss = criterion(logits, labels)
 
         if is_train:
