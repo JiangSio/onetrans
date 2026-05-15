@@ -18,8 +18,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from models.taac_onetrans import TAACOneTransClassifier
-from utils.common import json_ready_args, set_seed
+from models.taac_onetrans import AmazonOneTransClassifier
+from utils.common import json_ready_args, set_seed, split_indices, take_rows
 from utils.metrics import accuracy_from_logits, multiclass_auc_from_logits
 
 
@@ -103,6 +103,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--val-ratio", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--amp", dest="amp", action="store_true", help="Enable automatic mixed precision.")
@@ -124,6 +125,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Resume training from a checkpoint filename under output-dir, or from an explicit checkpoint path.",
     )
+    parser.add_argument("--id-emb-dim", type=int, default=64)
     parser.add_argument("--save-checkpoint", action="store_true")
     return parser.parse_args()
 
@@ -163,7 +165,7 @@ def build_tensors_from_interactions(
     seq_len: int,
     max_rows: int | None = None,
     negative_samples: int = 5,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, Any]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, Any], dict[str, Any]]:
     if max_rows is not None:
         interactions = interactions[:max_rows]
 
@@ -174,7 +176,6 @@ def build_tensors_from_interactions(
     all_items = sorted(item_features.keys())
     item_to_idx = {item: idx + 1 for idx, item in enumerate(all_items)}
     item_to_idx["UNK"] = 0
-    num_classes = len(all_items) + 1
 
     brands = set()
     categories = set()
@@ -281,7 +282,8 @@ def build_tensors_from_interactions(
     label_tensor = torch.tensor(labels, dtype=torch.long)
 
     metadata = {
-        "num_classes": num_classes,
+        "num_items": len(item_to_idx),
+        "num_users": len(user_to_idx),
         "non_seq_dim": non_seq_dim,
         "seq_feature_dim": seq_feature_dim,
         "seq_len": seq_len,
@@ -289,11 +291,15 @@ def build_tensors_from_interactions(
         "num_brands": len(brand_to_idx),
         "num_categories": len(category_to_idx),
         "max_cat_count": max_cat_count,
+    }
+    idmap = {
+        "item_to_idx": item_to_idx,
+        "user_to_idx": user_to_idx,
         "brand_to_idx": brand_to_idx,
         "category_to_idx": category_to_idx,
     }
 
-    return non_seq_tensor, seq_tensor, label_tensor, metadata
+    return non_seq_tensor, seq_tensor, label_tensor, metadata, idmap
 
 
 def run_epoch(
@@ -325,6 +331,7 @@ def run_epoch(
 
         with autocast_context(device_type=device_type, amp_dtype=amp_dtype, use_amp=use_amp):
             logits = model(non_seq_x, seq_x)
+            import pdb; pdb.set_trace()
             loss = criterion(logits, labels)
 
         if is_train:
@@ -350,29 +357,40 @@ def run_epoch(
     return total_loss / total_items, total_acc / total_items, auc
 
 
-def build_train_loaders(
+def build_loaders(
     non_seq_x: torch.Tensor,
     seq_x: torch.Tensor,
     labels: torch.Tensor,
     batch_size: int,
     num_workers: int,
+    val_ratio: float,
+    seed: int,
 ) -> tuple[DataLoader, DataLoader]:
-    num_samples = labels.size(0)
-
-    train_dataset = TensorDataset(non_seq_x, seq_x, labels)
-
+    train_idx, val_idx = split_indices(labels.size(0), val_ratio, seed)
+    train_dataset = TensorDataset(non_seq_x[train_idx], seq_x[train_idx], labels[train_idx])
+    val_dataset = TensorDataset(non_seq_x[val_idx], seq_x[val_idx], labels[val_idx])
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
     )
-
-    return train_loader
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+    )
+    return train_loader, val_loader
 
 
 def build_model(args: argparse.Namespace, non_seq_x: torch.Tensor, seq_x: torch.Tensor, labels: torch.Tensor) -> nn.Module:
-    return TAACOneTransClassifier(
+    return AmazonOneTransClassifier(
+        user_id_size=args.num_users,
+        item_id_size=args.num_items,
+        brand_id_size=args.num_brands,
+        category_id_size=args.num_categories,
+        id_emb_dim=args.id_emb_dim,
         non_seq_dim=non_seq_x.size(1),
         seq_feature_dim=seq_x.size(2),
         num_classes=max(int(labels.max().item()) + 1, 2),
@@ -476,25 +494,32 @@ def main() -> None:
     
     print(f"[data] building tensors from train split with negative samples={args.negative_samples}")
 
-    non_seq_x, seq_x, labels, metadata = build_tensors_from_interactions(
-        interactions=train_interactions,
+    # 将train valid合并，后期处理防止id映射不一致
+    non_seq_x, seq_x, labels, metadata, idmap = build_tensors_from_interactions(
+        interactions=train_interactions+valid_interactions,
         item_features=item_features,
         user_interactions=user_interactions,
         seq_len=args.seq_len,
         max_rows=args.max_rows,
         negative_samples=args.negative_samples,
     )
-    import pdb; pdb.set_trace()
+    args.num_items = metadata["num_items"]
+    args.num_users = metadata["num_users"]
+    args.num_brands = metadata["num_brands"]
+    args.num_categories = metadata["num_categories"]
+
     print(f"[data] tensors built: non_seq={tuple(non_seq_x.shape)} seq={tuple(seq_x.shape)} labels={tuple(labels.shape)}")
 
-    train_loader = build_train_loaders(
+    train_loader,val_loader = build_loaders(
         non_seq_x=non_seq_x,
         seq_x=seq_x,
         labels=labels,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
+        val_ratio=args.val_ratio,
+        seed=args.seed,
     )
-
+    
     model = build_model(args, non_seq_x, seq_x, labels)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     criterion = nn.CrossEntropyLoss()
@@ -503,7 +528,7 @@ def main() -> None:
     print("[run] metadata")
     print(json.dumps(metadata, indent=2, ensure_ascii=False))
     print(f"[run] device={args.device} samples={labels.size(0)} train={len(train_loader.dataset)} val={len(val_loader.dataset)}")
-    print(f"[run] non_seq={tuple(non_seq_x.shape)} seq={tuple(seq_x.shape)} classes={metadata['num_classes']}")
+    print(f"[run] non_seq={tuple(non_seq_x.shape)} seq={tuple(seq_x.shape)}")
     print(
         f"[run] amp={use_amp} amp_dtype={args.amp_dtype} "
         f"grad_scaler={scaler.is_enabled()} device_type={device_type} mask_type={args.mask_type} "
@@ -524,6 +549,7 @@ def main() -> None:
         print(f"[run] resumed from {resume_path}")
         print(f"[run] resume_start_epoch={start_epoch} resume_best_val_auc={best_val_auc:.4f}")
 
+    
     for epoch in range(start_epoch, args.epochs + 1):
         train_loss, train_acc, train_auc = run_epoch(
             model,
