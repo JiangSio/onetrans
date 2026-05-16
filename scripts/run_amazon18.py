@@ -412,6 +412,121 @@ def build_model(args: argparse.Namespace, non_seq_x: torch.Tensor, seq_x: torch.
     ).to(args.device)
 
 
+def run_test(
+    model: nn.Module,
+    test_interactions: list[tuple[int, list[int], int]],
+    item_features: dict[int, dict[str, Any]],
+    idmap: dict[str, dict],
+    device: str,
+    amp_dtype: torch.dtype,
+    use_amp: bool,
+    seq_len: int,
+    max_cat_count: int = 5,
+    top_k: list[int] = (5,10,20,),
+    output_dir: str | None = None,
+) -> dict[int, float]:
+    import csv
+    
+    item_to_idx = idmap["item_to_idx"]
+    user_to_idx = idmap["user_to_idx"]
+    brand_to_idx = idmap["brand_to_idx"]
+    category_to_idx = idmap["category_to_idx"]
+    
+    all_items = list(item_to_idx.keys())
+    all_items = [item for item in all_items if isinstance(item, int)]
+    
+    model.eval()
+    hits_dict = {k: 0 for k in top_k}
+    total = 0
+    
+    csv_rows = []
+    
+    max_top_k = max(top_k) if top_k else 10
+    
+    with torch.no_grad():
+        for user_id, history_items, target_item in tqdm(test_interactions, desc="Testing"):
+            user_idx = user_to_idx.get(user_id, 0)
+            
+            seq_features: list[list[int]] = []
+            for item_id in history_items[-seq_len:]:
+                item_idx = item_to_idx.get(item_id, 0)
+                brand = item_features.get(item_id, {}).get("brand", "").strip()
+                brand_idx = brand_to_idx.get(brand, 0)
+                cats = item_features.get(item_id, {}).get("categories", "")
+                cat_indices = []
+                if cats:
+                    for cat in cats.split(",")[:max_cat_count]:
+                        cat = cat.strip()
+                        if cat:
+                            cat_indices.append(category_to_idx.get(cat, 0))
+                while len(cat_indices) < max_cat_count:
+                    cat_indices.append(0)
+                seq_feature = [item_idx, brand_idx] + cat_indices
+                seq_features.append(seq_feature)
+            
+            while len(seq_features) < seq_len:
+                seq_features.append([0] * (2 + max_cat_count))
+            
+            seq_tensor = torch.tensor([seq_features], dtype=torch.long).to(device)
+            
+            scores = []
+            for item_id in all_items:
+                item_idx = item_to_idx.get(item_id, 0)
+                brand = item_features.get(item_id, {}).get("brand", "").strip()
+                brand_idx = brand_to_idx.get(brand, 0)
+                cats = item_features.get(item_id, {}).get("categories", "")
+                cat_indices = []
+                if cats:
+                    for cat in cats.split(",")[:max_cat_count]:
+                        cat = cat.strip()
+                        if cat:
+                            cat_indices.append(category_to_idx.get(cat, 0))
+                while len(cat_indices) < max_cat_count:
+                    cat_indices.append(0)
+                
+                non_seq = [user_idx, item_idx, brand_idx] + cat_indices
+                non_seq_tensor = torch.tensor([non_seq], dtype=torch.long).to(device)
+                
+                with torch.autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
+                    logits = model(non_seq_tensor, seq_tensor)
+                
+                score = logits[0, 1].item()
+                scores.append((item_id, score))
+                
+                csv_rows.append({
+                    "user_id": user_id,
+                    "history": ",".join(map(str, history_items)),
+                    "item_id": item_id,
+                    "score": score,
+                })
+            
+            scores.sort(key=lambda x: -x[1])
+            top_items = [item for item, _ in scores[:max_top_k]]
+            
+            for k in top_k:
+                if target_item in top_items[:k]:
+                    hits_dict[k] += 1
+            total += 1
+    
+    if output_dir is not None:
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        csv_path = output_path / "test_predictions.csv"
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["user_id", "history", "item_id", "score"])
+            writer.writeheader()
+            writer.writerows(csv_rows)
+        print(f"[test] Predictions saved to {csv_path}")
+    
+    hit_rates = {}
+    for k in top_k:
+        hit_rate = hits_dict[k] / total if total > 0 else 0.0
+        hit_rates[k] = hit_rate
+        print(f"[test] Hit Rate@{k} = {hit_rate:.4f} ({hits_dict[k]}/{total})")
+    
+    return hit_rates
+
+
 def save_run_artifacts(
     output_dir: Path,
     metadata: dict[str, Any],
@@ -606,6 +721,9 @@ def main() -> None:
     }
 
     save_run_artifacts(args.output_dir, metadata, args_payload, checkpoint_state, args.save_checkpoint)
+
+    best_model = model.load_state_dict(checkpoint_state["model"])
+    run_test(args, best_model, test_interactions, user_interactions, idmap)
 
 
 if __name__ == "__main__":
