@@ -67,7 +67,7 @@ def parse_args() -> argparse.Namespace:
         description="Run OneTrans classifier on Amazon18 dataset."
     )
     parser.add_argument("--data-dir", type=Path, default=PROJECT_ROOT / "dataset" / "data" / "Amazon18" / "Industrial_and_Scientific")
-    parser.add_argument("--max-rows", type=int, default=None, help="Limit the number of rows loaded for quick checks.")
+    parser.add_argument("--max-rows", type=int, default=20, help="Limit the number of rows loaded for quick checks.")
     parser.add_argument("--seq-len", type=int, default=8, help="Maximum sequence length kept per sample.")
     parser.add_argument("--ns-len", type=int, default=4, help="Number of non-sequence pseudo tokens.")
     parser.add_argument("--d-model", type=int, default=128)
@@ -722,8 +722,9 @@ def main() -> None:
 
     save_run_artifacts(args.output_dir, metadata, args_payload, checkpoint_state, args.save_checkpoint)
 
-    best_model = model.load_state_dict(checkpoint_state["model"])
-    run_test(args, best_model, test_interactions, user_interactions, idmap)
+    model.load_state_dict(checkpoint_state["model"])
+    run_test(model, test_interactions, item_features, idmap, args.device, amp_dtype=amp_dtype, use_amp=use_amp, seq_len=args.seq_len, output_dir=args.output_dir)
+
 
 
 if __name__ == "__main__":
