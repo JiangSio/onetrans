@@ -109,7 +109,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--amp", dest="amp", action="store_true", help="Enable automatic mixed precision.")
     parser.add_argument("--no-amp", dest="amp", action="store_false", help="Disable automatic mixed precision.")
-    parser.set_defaults(amp=torch.cuda.is_available())
+    parser.set_defaults(amp=False)
     parser.add_argument(
         "--amp-dtype",
         choices=("fp16", "bf16"),
@@ -283,7 +283,7 @@ def load_checkpoint_state(
 
 
 def main() -> None:
-    import pdb;pdb.set_trace()
+
     args = parse_args()
     set_seed(args.seed)
     args.output_dir.mkdir(parents=True, exist_ok=True)

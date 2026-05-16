@@ -68,13 +68,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--data-dir", type=Path, default=PROJECT_ROOT / "dataset" / "data" / "Amazon18" / "Industrial_and_Scientific")
     parser.add_argument("--max-rows", type=int, default=None, help="Limit the number of rows loaded for quick checks.")
-    parser.add_argument("--seq-len", type=int, default=16, help="Maximum sequence length kept per sample.")
+    parser.add_argument("--seq-len", type=int, default=8, help="Maximum sequence length kept per sample.")
     parser.add_argument("--ns-len", type=int, default=4, help="Number of non-sequence pseudo tokens.")
     parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--ffn-hidden", type=int, default=256)
-    parser.add_argument("--multi-num", type=int, default=4, help="How many OneTrans blocks to stack in each stage.")
-    parser.add_argument("--num-pyramid-layers", type=int, default=6)
+    parser.add_argument("--multi-num", type=int, default=1, help="How many OneTrans blocks to stack in each stage.")
+    parser.add_argument("--num-pyramid-layers", type=int, default=1)
     parser.add_argument("--pyramid-align", type=int, default=32)
     parser.add_argument(
         "--mask_type",
@@ -101,10 +101,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.set_defaults(use_checkpoint=False)
     parser.add_argument("--batch-size", type=int, default=1024)
-    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--val-ratio", type=float, default=0.1)
+    parser.add_argument("--val-ratio", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--amp", dest="amp", action="store_true", help="Enable automatic mixed precision.")
@@ -127,7 +127,7 @@ def parse_args() -> argparse.Namespace:
         help="Resume training from a checkpoint filename under output-dir, or from an explicit checkpoint path.",
     )
     parser.add_argument("--id-emb-dim", type=int, default=64)
-    parser.add_argument("--save-checkpoint", action="store_true")
+    parser.add_argument("--save-checkpoint", action="store_true", default=True)
     return parser.parse_args()
 
 
@@ -254,7 +254,7 @@ def build_tensors_from_interactions(
 
         for _ in range(negative_samples):
             random_user_id,_,negative_item = random.choice(interactions)
-            while random_user_id == user_id:
+            while random_user_id == user_id or negative_item in user_interactions.get(user_id, []) or negative_item == target_item:
                 random_user_id,_,negative_item = random.choice(interactions)
             negative_idx = item_to_idx.get(negative_item, 0)
             negative_brand = item_features.get(negative_item, {}).get("brand", "").strip()
@@ -582,9 +582,19 @@ def main() -> None:
         if not math.isnan(val_auc) and val_auc > best_val_auc:
             best_val_auc = val_auc
             best_epoch = epoch
+            checkpoint_state = {
+                "model": model.state_dict(),
+                "metadata": metadata,
+                "args": args_payload,
+                "optimizer": optimizer.state_dict(),
+                "scaler": scaler.state_dict() if scaler.is_enabled() else None,
+                "epoch": epoch,
+                "best_val_auc": best_val_auc,
+                "best_epoch": best_epoch,
+            }
 
     last_completed_epoch = max(start_epoch - 1, args.epochs)
-    checkpoint_state = {
+    last_checkpoint_state = {
         "model": model.state_dict(),
         "metadata": metadata,
         "args": args_payload,

@@ -101,7 +101,7 @@ class TAACOneTransClassifier(nn.Module):
         )
 
     def forward(self, non_seq_x: torch.Tensor, seq_x: torch.Tensor) -> torch.Tensor:
-        import pdb; pdb.set_trace()
+        
         batch_size = non_seq_x.size(0)
         ns_tokens = self.non_seq_tokenizer(non_seq_x).view(batch_size, self.ns_len, -1)
         seq_tokens = self.seq_tokenizer(seq_x)
