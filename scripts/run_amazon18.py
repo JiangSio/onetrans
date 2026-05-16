@@ -424,6 +424,7 @@ def run_test(
     max_cat_count: int = 5,
     top_k: list[int] = (5,10,20,),
     output_dir: str | None = None,
+    test_batch_size: int = 512,
 ) -> dict[int, float]:
     import csv
     
@@ -434,6 +435,25 @@ def run_test(
     
     all_items = list(item_to_idx.keys())
     all_items = [item for item in all_items if isinstance(item, int)]
+    num_items = len(all_items)
+    
+    precomputed_item_features = []
+    for item_id in all_items:
+        item_idx = item_to_idx.get(item_id, 0)
+        brand = item_features.get(item_id, {}).get("brand", "").strip()
+        brand_idx = brand_to_idx.get(brand, 0)
+        cats = item_features.get(item_id, {}).get("categories", "")
+        cat_indices = []
+        if cats:
+            for cat in cats.split(",")[:max_cat_count]:
+                cat = cat.strip()
+                if cat:
+                    cat_indices.append(category_to_idx.get(cat, 0))
+        while len(cat_indices) < max_cat_count:
+            cat_indices.append(0)
+        precomputed_item_features.append([item_idx, brand_idx] + cat_indices)
+    
+    precomputed_item_tensor = torch.tensor(precomputed_item_features, dtype=torch.long).to(device)
     
     model.eval()
     hits_dict = {k: 0 for k in top_k}
@@ -467,38 +487,33 @@ def run_test(
             while len(seq_features) < seq_len:
                 seq_features.append([0] * (2 + max_cat_count))
             
-            seq_tensor = torch.tensor([seq_features], dtype=torch.long).to(device)
+            seq_tensor = torch.tensor(seq_features, dtype=torch.long).to(device)
+            seq_tensor = seq_tensor.unsqueeze(0).repeat(num_items, 1, 1)
             
-            scores = []
-            for item_id in all_items:
-                item_idx = item_to_idx.get(item_id, 0)
-                brand = item_features.get(item_id, {}).get("brand", "").strip()
-                brand_idx = brand_to_idx.get(brand, 0)
-                cats = item_features.get(item_id, {}).get("categories", "")
-                cat_indices = []
-                if cats:
-                    for cat in cats.split(",")[:max_cat_count]:
-                        cat = cat.strip()
-                        if cat:
-                            cat_indices.append(category_to_idx.get(cat, 0))
-                while len(cat_indices) < max_cat_count:
-                    cat_indices.append(0)
-                
-                non_seq = [user_idx, item_idx, brand_idx] + cat_indices
-                non_seq_tensor = torch.tensor([non_seq], dtype=torch.long).to(device)
+            user_idx_tensor = torch.full((num_items, 1), user_idx, dtype=torch.long).to(device)
+            non_seq_tensor = torch.cat([user_idx_tensor, precomputed_item_tensor], dim=1)
+            
+            all_scores = []
+            for i in range(0, num_items, test_batch_size):
+                batch_non_seq = non_seq_tensor[i:i+test_batch_size]
+                batch_seq = seq_tensor[i:i+test_batch_size]
                 
                 with torch.autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
-                    logits = model(non_seq_tensor, seq_tensor)
+                    logits = model(batch_non_seq, batch_seq)
                 
-                score = logits[0, 1].item()
-                scores.append((item_id, score))
-                
-                csv_rows.append({
-                    "user_id": user_id,
-                    "history": ",".join(map(str, history_items)),
-                    "item_id": item_id,
-                    "score": score,
-                })
+                batch_scores = logits[:, 1].cpu().numpy()
+                all_scores.extend(batch_scores)
+            
+            scores = list(zip(all_items, all_scores))
+            
+            if output_dir is not None:
+                for item_id, score in scores:
+                    csv_rows.append({
+                        "user_id": user_id,
+                        "history": ",".join(map(str, history_items)),
+                        "item_id": item_id,
+                        "score": score,
+                    })
             
             scores.sort(key=lambda x: -x[1])
             top_items = [item for item, _ in scores[:max_top_k]]
